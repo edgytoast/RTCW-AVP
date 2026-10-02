@@ -1,0 +1,239 @@
+diff -ru -x *.orig a/client/cl_input.c b/client/cl_input.c
+--- a/client/cl_input.c	2026-09-30 11:21:36
++++ b/client/cl_input.c	2026-09-30 14:27:05
+@@ -29,6 +29,9 @@
+ // cl.input.c  -- builds an intended movement command to send to the server
+ 
+ #include "client.h"
++#ifdef VISIONOS
++#include "vos_headpose.h"
++#endif
+ 
+ unsigned frame_msec;
+ int old_com_frameTime;
+@@ -655,6 +658,11 @@
+ 
+ 	// get basic movement from joystick
+ 	CL_JoystickMove( &cmd );
++
++#ifdef VISIONOS
++	// VR head tracking: pitch from the head, head yaw delta added to body yaw (M4).
++	VOS_Head_ApplyToViewAngles( cl.viewangles );
++#endif
+ 
+ 	// check to make sure the angles haven't wrapped
+ 	if ( cl.viewangles[PITCH] - oldAngles[PITCH] > 90 ) {
+diff -ru -x *.orig a/client/cl_scrn.c b/client/cl_scrn.c
+--- a/client/cl_scrn.c	2026-09-30 11:21:36
++++ b/client/cl_scrn.c	2026-09-30 14:34:30
+@@ -29,6 +29,9 @@
+ // cl_scrn.c -- master for refresh, status bar, console, chat, notify, etc
+ 
+ #include "client.h"
++#ifdef VISIONOS
++#include "vos_xr.h"
++#endif
+ 
+ qboolean scr_initialized;           // ready to draw
+ 
+@@ -580,6 +583,12 @@
+ 		// XXX
+ 		int in_anaglyphMode = Cvar_VariableIntegerValue("r_anaglyphMode");
+ 		// if running in stereo, we need to draw the frame twice
++#ifdef VISIONOS
++		// VR: menus, loading, cinematics and briefings go onto a virtual screen (M5, issue #1).
++		if ( VOS_XR_Active() && VOS_XR_UseScreen( clc.state != CA_ACTIVE || ( Key_GetCatcher() & KEYCATCH_UI ) ) ) {
++			SCR_DrawScreenField( STEREO_CENTER );
++		} else
++#endif
+ 		if ( cls.glconfig.stereoEnabled || in_anaglyphMode) {
+ 			SCR_DrawScreenField( STEREO_LEFT );
+ 			SCR_DrawScreenField( STEREO_RIGHT );
+diff -ru -x *.orig a/qcommon/vm.c b/qcommon/vm.c
+--- a/qcommon/vm.c	2026-09-30 11:21:36
++++ b/qcommon/vm.c	2026-09-30 12:10:30
+@@ -619,6 +619,19 @@
+ 
+ 	Q_strncpyz(vm->name, module, sizeof(vm->name));
+ 
++#ifdef VISIONOS
++	// visionOS: game modules are statically linked; resolve by module name
++	// instead of searching the filesystem for a dll.
++	vm->dllHandle = Sys_LoadGameDll( module, &vm->entryPoint, VM_DllSyscall );
++	if ( vm->dllHandle ) {
++		vm->systemCall = systemCalls;
++		return vm;
++	}
++	Com_Printf( "VM_Create: no static module '%s'\n", module );
++	VM_Free( vm );
++	return NULL;
++#endif
++
+ 	do
+ 	{
+ 		retval = FS_FindVM(&startSearch, filename, sizeof(filename), module, (interpret == VMI_NATIVE));
+diff -ru -x *.orig a/renderer/tr_backend.c b/renderer/tr_backend.c
+--- a/renderer/tr_backend.c	2026-09-30 11:21:36
++++ b/renderer/tr_backend.c	2026-09-30 14:42:12
+@@ -1108,7 +1108,17 @@
+ 	qglScissor( 0, 0, glConfig.vidWidth, glConfig.vidHeight );
+ 	qglMatrixMode( GL_PROJECTION );
+ 	qglLoadIdentity();
++#ifdef VISIONOS
++	{
++		float o[4];   // VR HUD: scaled toward the view center, per-eye stereo depth (M5)
++		if ( VOS_XR_Hud2D( glConfig.vidWidth, glConfig.vidHeight, o ) )
++			qglOrtho( o[0], o[1], o[2], o[3], 0, 1 );
++		else
++			qglOrtho( 0, glConfig.vidWidth, glConfig.vidHeight, 0, 0, 1 );
++	}
++#else
+ 	qglOrtho( 0, glConfig.vidWidth, glConfig.vidHeight, 0, 0, 1 );
++#endif
+ 	qglMatrixMode( GL_MODELVIEW );
+ 	qglLoadIdentity();
+ 
+@@ -1460,7 +1470,8 @@
+ 
+ 	cmd = (const drawBufferCommand_t *)data;
+ 
+-#ifndef USE_OPENGLES
++#if !defined( USE_OPENGLES ) || defined( VISIONOS )
++	// visionOS: the GLES DrawBuffer shim binds the eye framebuffer for stereo.
+ 	qglDrawBuffer( cmd->buffer );
+ #endif
+ 
+diff -ru -x *.orig a/renderer/tr_cmds.c b/renderer/tr_cmds.c
+--- a/renderer/tr_cmds.c	2026-09-30 11:21:36
++++ b/renderer/tr_cmds.c	2026-09-30 14:36:41
+@@ -478,6 +478,20 @@
+ 		}
+ 	}
+ 
++#ifdef VISIONOS
++	// Immersive: GLimp's DrawBuffer shim binds the eye framebuffer, or the virtual
++	// screen for STEREO_CENTER (menus/cinematics, drawn once).
++	if ( VOS_XR_Active() ) {
++		if ( !( cmd = R_GetCommandBuffer( sizeof( *cmd ) ) ) )
++			return;
++		cmd->commandId = RC_DRAW_BUFFER;
++		cmd->buffer = stereoFrame == STEREO_RIGHT ? VOS_GL_BACK_RIGHT :
++			stereoFrame == STEREO_LEFT || !VOS_XR_ScreenMode() ? VOS_GL_BACK_LEFT : VOS_GL_BACK_SCREEN;
++		tr.refdef.stereoFrame = stereoFrame;
++		return;
++	}
++#endif
++
+ #ifndef USE_OPENGLES
+ 	if (glConfig.stereoEnabled) {
+ 		if( !(cmd = R_GetCommandBuffer(sizeof(*cmd))) )
+diff -ru -x *.orig a/renderer/tr_local.h b/renderer/tr_local.h
+--- a/renderer/tr_local.h	2026-09-30 11:21:36
++++ b/renderer/tr_local.h	2026-09-30 14:34:30
+@@ -35,6 +35,14 @@
+ #include "../qcommon/qcommon.h"
+ #include "tr_public.h"
+ #include "qgl.h"
++#ifdef VISIONOS
++#include "vos_xr.h"
++#include "vos_headpose.h"
++#define VOS_GL_BACK_LEFT  0x0402   // GL_BACK_LEFT/RIGHT (absent from GLES headers)
++#define VOS_GL_BACK_RIGHT 0x0403
++#define VOS_GL_BACK_SCREEN 0x7F01  // private: virtual screen target (menus, cinematics)
++#define VOS_WORLDSCALE    37.5f    // game units per meter (RTCWQuest cg_worldScale)
++#endif
+ #include "iqm.h"
+ 
+ #define GLE(ret, name, ...) extern name##proc * qgl##name;
+diff -ru -x *.orig a/renderer/tr_main.c b/renderer/tr_main.c
+--- a/renderer/tr_main.c	2026-09-30 11:21:36
++++ b/renderer/tr_main.c	2026-09-30 13:51:14
+@@ -857,6 +857,33 @@
+ 	float	xmin, xmax, ymin, ymax;
+ 	float	width, height, stereoSep = r_stereoSeparation->value;
+ 
++#ifdef VISIONOS
++	// Immersive: per-eye asymmetric frustum from the compositor's view tangents,
++	// parallel eye axes offset by the eye's position (RTCWQuest tr_main.c/tr_scene.c idea).
++	float tan4[4], eyeX, sep;
++	if ( VOS_XR_Active() && VOS_XR_GetEye( dest->stereoFrame == STEREO_RIGHT ? 1 : 0, tan4, &eyeX ) ) {
++		xmin = -tan4[0] * zProj;
++		xmax =  tan4[1] * zProj;
++		ymax =  tan4[2] * zProj;
++		ymin = -tan4[3] * zProj;
++		width = xmax - xmin;
++		height = ymax - ymin;
++		sep = -eyeX * VOS_WORLDSCALE;   // + = eye to the left (axis[1])
++
++		Com_Memset( dest->projectionMatrix, 0, sizeof( dest->projectionMatrix ) );
++		dest->projectionMatrix[0] = 2 * zProj / width;
++		dest->projectionMatrix[8] = ( xmax + xmin ) / width;
++		dest->projectionMatrix[12] = 2 * zProj * sep / width;
++		dest->projectionMatrix[5] = 2 * zProj / height;
++		dest->projectionMatrix[9] = ( ymax + ymin ) / height;
++		dest->projectionMatrix[11] = -1;
++
++		if ( computeFrustum )
++			R_SetupFrustum( dest, xmin - sep, xmax - sep, MAX( ymax, -ymin ), zProj, sep );
++		return;
++	}
++#endif
++
+ 	/*
+ 	 * offset the view origin of the viewer for stereo rendering 
+ 	 * by setting the projection matrix appropriately.
+diff -ru -x *.orig a/renderer/tr_scene.c b/renderer/tr_scene.c
+--- a/renderer/tr_scene.c	2026-09-30 11:21:36
++++ b/renderer/tr_scene.c	2026-09-30 14:43:47
+@@ -530,6 +530,29 @@
+ 	VectorCopy( fd->viewaxis[1], parms.or.axis[1] );
+ 	VectorCopy( fd->viewaxis[2], parms.or.axis[2] );
+ 
++#ifdef VISIONOS
++	// VR head roll and position: rendering only, no gameplay effect (M4, issue #5).
++	if ( VOS_XR_Active() && !( fd->rdflags & RDF_NOWORLDMODEL ) ) {
++		float roll = VOS_Head_Roll(), off[3];
++		float bodyYaw = RAD2DEG( atan2( parms.or.axis[0][1], parms.or.axis[0][0] ) );
++		if ( VOS_Head_PositionOffset( bodyYaw, 0.3f, off ) ) {
++			parms.or.origin[0] += off[0] * VOS_WORLDSCALE;
++			parms.or.origin[1] += off[1] * VOS_WORLDSCALE;
++			parms.or.origin[2] += off[2] * VOS_WORLDSCALE;
++			VectorCopy( parms.or.origin, tr.refdef.vieworg );
++		}
++		if ( roll != 0.0f ) {
++			vec3_t l, u;
++			RotatePointAroundVector( l, parms.or.axis[0], parms.or.axis[1], roll );
++			RotatePointAroundVector( u, parms.or.axis[0], parms.or.axis[2], roll );
++			VectorCopy( l, parms.or.axis[1] );
++			VectorCopy( u, parms.or.axis[2] );
++			VectorCopy( l, tr.refdef.viewaxis[1] );
++			VectorCopy( u, tr.refdef.viewaxis[2] );
++		}
++	}
++#endif
++
+ 	VectorCopy( fd->vieworg, parms.pvsOrigin );
+ 
+ 	R_RenderView( &parms );
+diff -ru -x *.orig a/sys/sys_unix.c b/sys/sys_unix.c
+--- a/sys/sys_unix.c	2026-09-30 11:21:36
++++ b/sys/sys_unix.c	2026-09-30 12:10:53
+@@ -1053,6 +1053,10 @@
+ ==================
+ */
+ void Sys_DoStartProcess( char *cmdline ) {
++#ifdef VISIONOS
++	// No process spawning on visionOS.
++	printf( "Sys_DoStartProcess unsupported: %s\n", cmdline );
++#else
+ 	switch ( fork() )
+ 	{
+ 	case - 1:
+@@ -1075,6 +1079,7 @@
+ 		_exit( 0 );
+ 		break;
+ 	}
++#endif
+ }
+ 
+ /*
