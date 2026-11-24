@@ -52,3 +52,7 @@ No signing certificate? In Xcode, go to **Settings → Accounts**, add your Appl
 - In VR you aim with your head; tilting the controller fine-tunes the aim (gyro).
 - `make headset-log` fetches the game's console log to `build/logs/device.log`.
 - The engine is GPLv3 (iortcw). Return to Castle Wolfenstein game data is © id Software / ZeniMax and is not part of this project.
+
+## Support
+
+This fork keeps Return to Castle Wolfenstein installable on Apple Vision Pro. It's maintained as part of the [AVP Ports Index](https://github.com/edgytoast/avp-ports-index), which tracks every port we can find and runs a safety check on each one. If this guide got you playing, you can [buy me a coffee](https://buymeacoffee.com/adminpz) to help keep it running.
